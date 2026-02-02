@@ -13,7 +13,7 @@ from pydantic import BaseModel
 import uvicorn
 
 # --- 설정 ---
-TARGET_BJ_ID = "juns12114" # "tjrdbs999"
+TARGET_BJ_ID = "tjrdbs999"
 TARGET_BJ_NAME = "지피티"
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -64,27 +64,48 @@ class AutoMonitorBot:
         self.monitor_task = None
 
     async def run_forever(self):
-        """24시간 무한 감시 루프"""
-        print(f"🤖 [{TARGET_BJ_NAME}] 자동 감시 봇 가동 (ID: {TARGET_BJ_ID})")
+        """지능형 자동 감지 루프"""
+        print(f"🤖 [{TARGET_BJ_NAME}] 스마트 감지 봇 가동 (ID: {TARGET_BJ_ID})")
+        
+        # 리방(방송 재시작) 감지를 위한 변수
+        self.last_stream_end_time = None
         
         while True:
             try:
-                # 1. 방송 상태 체크
+                # 1. 현재 방송 상태 확인
                 broad_info = await self.check_live_status()
+                now = datetime.now()
                 
                 if broad_info:
-                    # 방송 중 발견!
+                    # [방송 중]
                     if not self.is_live or self.current_bno != broad_info['broad_no']:
-                        print(f"\n📺 방송 시작 감지! 제목: {broad_info['broad_title']}")
+                        print(f"\n📺 방송 시작 감지! ({broad_info['broad_title']})")
                         await self.start_session(broad_info)
+                    
+                    # 방송 중일 때는 API 호출을 최대한 아끼고 WebSocket 유지에 집중
+                    # 단, 1분마다 방송 정보(제목 등) 업데이트를 위해 체크
+                    sleep_time = 60 
+
                 else:
-                    # 방송 아님
+                    # [방송 OFF]
                     if self.is_live:
-                        print("\n💤 방송 종료 감지. 대기 모드 전환...")
+                        print(f"\n💤 방송 종료 감지. ({datetime.now().strftime('%H:%M:%S')})")
                         await self.stop_session()
+                        self.last_stream_end_time = datetime.now()
+
+                    # --- 스마트 스케줄링 (API 호출 최소화 전략) ---
+                    # 1. 리방 의심 구간: 방송 종료 후 9분간은 3분마다 체크 (약 3회)
+                    if self.last_stream_end_time and (now - self.last_stream_end_time).total_seconds() < 540:
+                        sleep_time = 180
+                    
+                    # 2. 피크 타임 (오후 4시 ~ 6시): 3분마다 체크 (집중 감시 구간)
+                    elif 16 <= now.hour < 18:
+                        sleep_time = 180
+                        
+                    # 3. 그 외 (18시 이후 포함): 10분마다 체크 (절전 모드)
+                    else:
+                        sleep_time = 600
                 
-                # 방송 중이면 10초마다, 대기 중이면 5분(300초)마다 체크
-                sleep_time = 10 if self.is_live else 300
                 await asyncio.sleep(sleep_time)
                 
             except Exception as e:
@@ -103,7 +124,6 @@ class AutoMonitorBot:
             ))
             
             broad = res.get("broad")
-            print(broad)
             if broad:
                 return {
                     "broad_no": broad["broad_no"],
@@ -116,8 +136,7 @@ class AutoMonitorBot:
 
     async def start_session(self, broad_info):
         """새로운 방송 세션 시작"""
-        await self.stop_session() # 이전 세션 정리
-        
+        await self.stop_session() 
         self.is_live = True
         self.current_bno = broad_info['broad_no']
         self.broadcast_title = broad_info['broad_title']
@@ -130,7 +149,6 @@ class AutoMonitorBot:
         self.hot_moments.clear()
         self.last_hot_time = None
         
-        # 채팅 서버 접속 정보 가져오기
         chat_info = await self.get_chat_connection_info(self.current_bno)
         if chat_info:
             self.ws_task = asyncio.create_task(self.connect_websocket(chat_info))
@@ -138,14 +156,11 @@ class AutoMonitorBot:
     async def stop_session(self):
         """세션 종료 및 정리"""
         self.is_live = False
+        self.current_bno = None  # 확실하게 초기화
         self.broadcast_title = "방송 준비 중"
         
         if self.ws_task:
             self.ws_task.cancel()
-            try:
-                await self.ws_task
-            except asyncio.CancelledError:
-                pass
             self.ws_task = None
 
     async def get_chat_connection_info(self, bno):
@@ -252,10 +267,8 @@ class AutoMonitorBot:
                             self.last_hot_time = now
                             print(f"\n🔥🔥 [이슈] {now.strftime('%H:%M:%S')} - 30초 {density}회 지창!")
                     
+                    
                     print(f"🔥 지창 ({self.ji_chang_count}) | {nickname}: {msg}")
-                else:
-                    # 일반 채팅 (디버깅용, 필요 시 주석)
-                    print(f"[채팅] {nickname}: {msg}")
         except Exception: pass
 
 # --- FastAPI App ---
