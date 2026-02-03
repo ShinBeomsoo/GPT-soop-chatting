@@ -33,13 +33,93 @@ class HotMoment(BaseModel):
     count: int
     description: str
 
+class BroadcastHistory(BaseModel):
+    date: str
+    title: str
+    total_ji_chang: int
+    total_sesin: int = 0
+    total_jjajang: int = 0
+    total_djrg: int = 0
+
 class StatsResponse(BaseModel):
     status: str            # LIVE / WAITING
     broadcast_title: str
     started_at: Optional[str] = None
-    ji_chang_count: int
+    
+    # 밈별 데이터
+    ji_chang_wave_count: int
+    total_ji_chang_chat_count: int
+    
+    sesin_wave_count: int
+    total_sesin_chat_count: int
+    
+    jjajang_wave_count: int
+    total_jjajang_chat_count: int
+    
+    djrg_wave_count: int
+    total_djrg_chat_count: int
+    
     last_detected_at: Optional[datetime] = None
     hot_moments: List[HotMoment] = []
+    history: List[BroadcastHistory] = []
+
+class MemeScanner:
+    def __init__(self, key, pattern, name_kr):
+        self.key = key
+        self.pattern = pattern
+        self.name_kr = name_kr
+        
+        self.wave_count = 0
+        self.total_count = 0
+        
+        # Streak 상태
+        self.streak_start = None
+        self.streak_last = None
+        self.streak_count = 0
+        self.streak_confirmed = False
+
+    def reset(self):
+        """세션 시작 시 초기화"""
+        self.wave_count = 0
+        self.total_count = 0
+        self.reset_streak()
+    
+    def reset_streak(self):
+        self.streak_start = None
+        self.streak_last = None
+        self.streak_count = 0
+        self.streak_confirmed = False
+
+    def process(self, msg, now):
+        """메시지 처리 및 웨이브 감지"""
+        if re.search(self.pattern, msg):
+            self.total_count += 1
+            
+            # --- [지속성 감지 로직] ---
+            # 1. 10초 이상 끊기면 리셋
+            if self.streak_last and (now - self.streak_last).total_seconds() > 10:
+                self.reset_streak()
+            
+            # 2. 시작점 설정
+            if self.streak_start is None:
+                self.streak_start = now
+                self.streak_count = 0
+                self.streak_confirmed = False
+            
+            self.streak_count += 1
+            self.streak_last = now
+            
+            # 3. 판단 (10초 지속, 20개 메시지)
+            dt_duration = (now - self.streak_start).total_seconds()
+            
+            if dt_duration >= 10 and self.streak_count >= 20:
+                if not self.streak_confirmed:
+                    self.wave_count += 1
+                    self.streak_confirmed = True
+                    print(f"🌊 [WAVE] {self.name_kr} 10초 지속 확정! (시즌 {self.wave_count}회)")
+            
+            return True
+        return False
 
 class AutoMonitorBot:
     def __init__(self):
@@ -48,9 +128,23 @@ class AutoMonitorBot:
         self.broadcast_title = "방송 준비 중"
         self.broadcast_start_time = None
         
-        # 통계 데이터
-        self.ji_chang_count = 0
+        # 밈 스캐너 초기화
+        self.scanners = {
+            "ji_chang": MemeScanner("ji_chang", r"지[ㅡ\s~-]*창", "지창"),
+            "sesin": MemeScanner("sesin", r"세[ㅡ\s~-]*신", "세신"),
+            "jjajang": MemeScanner("jjajang", r"짜[ㅡ\s~-]*장[ㅡ\s~-]*면", "짜장면"),
+            "djrg": MemeScanner("djrg", r"ㄷ[ㅡ\s~-]*ㅈ[ㅡ\s~-]*ㄹ[ㅡ\s~-]*ㄱ", "ㄷㅈㄹㄱ"),
+        }
+        
         self.last_detected_at = None
+        
+        # 이슈 감지
+        
+        # 지창 지속 감지(Streak) 변수
+        self.streak_start_time = None
+        self.streak_last_time = None
+        self.streak_msg_count = 0
+        self.streak_confirmed = False
         
         # 이슈 감지
         self.window_seconds = 30
@@ -58,6 +152,7 @@ class AutoMonitorBot:
         self.timestamps = deque()
         self.hot_moments = []
         self.last_hot_time = None
+        self.history = []         # 지난 방송 기록 (성적표)
         
         self.queue = asyncio.Queue()
         self.ws_task = None
@@ -143,8 +238,10 @@ class AutoMonitorBot:
         self.broadcast_start_time = broad_info['start_time']
         
         # 통계 초기화
-        self.ji_chang_count = 0
+        for scanner in self.scanners.values():
+            scanner.reset()
         self.last_detected_at = None
+        
         self.timestamps.clear()
         self.hot_moments.clear()
         self.last_hot_time = None
@@ -154,7 +251,29 @@ class AutoMonitorBot:
             self.ws_task = asyncio.create_task(self.connect_websocket(chat_info))
     
     async def stop_session(self):
-        """세션 종료 및 정리"""
+        """세션 종료 및 정리 (성적표 저장)"""
+        if self.is_live:
+            # 방송 기록 저장 (방송 시작 날짜 기준)
+            try:
+                # 아프리카TV 시간 포맷 (예: 2023-10-10 18:00:00)
+                date_str = self.broadcast_start_time.split(' ')[0]
+            except:
+                date_str = datetime.now().strftime('%Y-%m-%d')
+
+            self.history.insert(0, {
+                "date": date_str,
+                "title": self.broadcast_title,
+                "total_ji_chang": self.scanners["ji_chang"].wave_count,
+                "total_sesin": self.scanners["sesin"].wave_count,
+                "total_jjajang": self.scanners["jjajang"].wave_count,
+                "total_djrg": self.scanners["djrg"].wave_count
+            })
+            # 히스토리 50개 유지
+            if len(self.history) > 50:
+                self.history.pop()
+            
+            print(f"✅ 방송 종료 기록 저장: {date_str} | 지창W: {self.scanners['ji_chang'].wave_count}")
+
         self.is_live = False
         self.current_bno = None  # 확실하게 초기화
         self.broadcast_title = "방송 준비 중"
@@ -241,12 +360,18 @@ class AutoMonitorBot:
                 msg, nickname = parts[1], parts[6]
                 if msg in ["-1", "1"] or "fw=" in msg: return
                 
-                if re.search(r"지[ㅡ\s~-]*창", msg):
-                    now = datetime.now()
-                    self.ji_chang_count += 1
-                    self.last_detected_at = now
-                    
-                    # 핫타임 로직
+                # 모든 스캐너 체크
+                detected = False
+                now = datetime.now()
+                for key, scanner in self.scanners.items():
+                    if scanner.process(msg, now):
+                        detected = True
+                        self.last_detected_at = now
+                        # 로그 출력 (선택)
+                        # print(f"🔥 {scanner.name_kr} ({scanner.total_count}) | {nickname}: {msg}")
+
+                if detected:
+                    # 핫타임 로직 (통합 이슈 감지용)
                     self.timestamps.append(now)
                     cutoff = now - timedelta(seconds=self.window_seconds)
                     while self.timestamps and self.timestamps[0] < cutoff:
@@ -258,17 +383,14 @@ class AutoMonitorBot:
                             self.hot_moments.insert(0, {
                                 "time": now.strftime('%Y-%m-%d %H:%M:%S'),
                                 "count": density,
-                                "description": f"30초간 {density}회 지창 폭주!"
+                                "description": f"30초간 {density}회 밈 폭주!"
                             })
                             # 메모리 보호: 최근 100개 이슈만 유지
                             if len(self.hot_moments) > 100:
                                 self.hot_moments.pop()
                                 
                             self.last_hot_time = now
-                            print(f"\n🔥🔥 [이슈] {now.strftime('%H:%M:%S')} - 30초 {density}회 지창!")
-                    
-                    
-                    print(f"🔥 지창 ({self.ji_chang_count}) | {nickname}: {msg}")
+                            print(f"\n🔥🔥 [이슈] {now.strftime('%H:%M:%S')} - 30초 {density}회 반응!")
         except Exception: pass
 
 # --- FastAPI App ---
@@ -296,9 +418,22 @@ async def get_stats():
         status="LIVE" if bot.is_live else "WAITING",
         broadcast_title=bot.broadcast_title,
         started_at=bot.broadcast_start_time,
-        ji_chang_count=bot.ji_chang_count,
+        
+        ji_chang_wave_count=bot.scanners["ji_chang"].wave_count,
+        total_ji_chang_chat_count=bot.scanners["ji_chang"].total_count,
+        
+        sesin_wave_count=bot.scanners["sesin"].wave_count,
+        total_sesin_chat_count=bot.scanners["sesin"].total_count,
+        
+        jjajang_wave_count=bot.scanners["jjajang"].wave_count,
+        total_jjajang_chat_count=bot.scanners["jjajang"].total_count,
+        
+        djrg_wave_count=bot.scanners["djrg"].wave_count,
+        total_djrg_chat_count=bot.scanners["djrg"].total_count,
+        
         last_detected_at=bot.last_detected_at,
-        hot_moments=bot.hot_moments
+        hot_moments=bot.hot_moments,
+        history=bot.history
     )
 
 if __name__ == "__main__":
