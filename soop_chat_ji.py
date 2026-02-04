@@ -130,6 +130,34 @@ class StatsResponse(BaseModel):
     history: list[BroadcastHistoryResponse] = []
 
 
+class HotMomentFileResponse(BaseModel):
+    """Hot Moment 파일 응답 모델"""
+    time: str
+    count: int
+    description: str
+    detected_memes: list[str] = []
+
+
+class SessionResponse(BaseModel):
+    """방송 세션 응답 모델"""
+    broadcast_title: str
+    saved_at: str
+    hot_moments: list[HotMomentFileResponse]
+
+
+class DailyHistoryResponse(BaseModel):
+    """날짜별 히스토리 응답 모델"""
+    date: str
+    last_updated: Optional[str] = None
+    sessions: list[SessionResponse] = []
+
+
+class HistoryListResponse(BaseModel):
+    """히스토리 목록 응답 모델"""
+    available_dates: list[str]
+    total_files: int
+
+
 # ==============================================================================
 # 도메인 모델 (Domain Models)
 # ==============================================================================
@@ -183,10 +211,11 @@ class BroadcastHistory:
 
 @dataclass
 class WaveDetectionConfig:
-    """Wave 감지 설정"""
+    """웨이브 감지 설정"""
     min_duration_seconds: float = 10.0
     min_message_count: int = 20
     gap_timeout_seconds: float = 10.0
+    cooldown_seconds: float = 60.0  # Wave 확정 후 쿨다운
 
 
 class MemeScanner:
@@ -202,7 +231,8 @@ class MemeScanner:
     __slots__ = (
         "_pattern", "_config", "_compiled_regex",
         "_wave_count", "_total_count",
-        "_streak_start", "_streak_last", "_streak_count", "_streak_confirmed"
+        "_streak_start", "_streak_last", "_streak_count", "_streak_confirmed",
+        "_last_wave_time"  # 웨이브 쿨다운용
     )
     
     def __init__(
@@ -223,6 +253,7 @@ class MemeScanner:
         self._streak_last: Optional[datetime] = None
         self._streak_count = 0
         self._streak_confirmed = False
+        self._last_wave_time: Optional[datetime] = None  # 마지막 Wave 확정 시간
     
     @property
     def key(self) -> str:
@@ -244,6 +275,7 @@ class MemeScanner:
         """새 세션 시작 시 모든 상태를 초기화합니다."""
         self._wave_count = 0
         self._total_count = 0
+        self._last_wave_time = None
         self._reset_streak()
     
     def _reset_streak(self) -> None:
@@ -308,6 +340,10 @@ class MemeScanner:
         if self._streak_confirmed or self._streak_start is None:
             return
         
+        # 쿨다운 체크
+        if not self._is_cooldown_passed(timestamp):
+            return
+        
         duration = (timestamp - self._streak_start).total_seconds()
         is_long_enough = duration >= self._config.min_duration_seconds
         is_count_enough = self._streak_count >= self._config.min_message_count
@@ -315,7 +351,16 @@ class MemeScanner:
         if is_long_enough and is_count_enough:
             self._wave_count += 1
             self._streak_confirmed = True
+            self._last_wave_time = timestamp
             self._log_wave_confirmed()
+    
+    def _is_cooldown_passed(self, timestamp: datetime) -> bool:
+        """웨이브 쿨다운이 지났는지 확인합니다."""
+        if self._last_wave_time is None:
+            return True
+        
+        elapsed = (timestamp - self._last_wave_time).total_seconds()
+        return elapsed > self._config.cooldown_seconds
     
     def _log_wave_confirmed(self) -> None:
         """Wave 확정 로그를 출력합니다."""
@@ -620,7 +665,7 @@ class HotMomentConfig:
     """Hot Moment 감지 설정"""
     window_seconds: int = 10 
     threshold_count: int = 20
-    cooldown_seconds: int = 60
+    cooldown_seconds: int = 60  # 60초 쿨다운 (Wave와 동일)
     max_history: int = 100
     data_directory: str = "data/hot_moments"
 
@@ -1376,6 +1421,16 @@ def create_app() -> FastAPI:
     async def get_stats():
         return _build_stats_response(bot)
     
+    @application.get("/history")
+    async def get_history_list():
+        """data/hot_moments/ 디렉토리의 사용 가능한 날짜 목록을 반환합니다."""
+        return _get_available_history_dates()
+    
+    @application.get("/history/{date}")
+    async def get_history_by_date(date: str):
+        """특정 날짜의 Hot Moments 데이터를 반환합니다."""
+        return _load_history_file(date)
+    
     return application
 
 
@@ -1420,6 +1475,82 @@ def _build_stats_response(bot: AutoMonitorBot) -> StatsResponse:
             for record in bot.history
         ]
     )
+
+
+# Hot Moments 히스토리 관련 상수
+HOT_MOMENTS_DIR = "data/hot_moments"
+
+
+def _get_available_history_dates() -> HistoryListResponse:
+    """사용 가능한 히스토리 날짜 목록을 반환합니다."""
+    import os
+    
+    if not os.path.exists(HOT_MOMENTS_DIR):
+        return HistoryListResponse(available_dates=[], total_files=0)
+    
+    files = []
+    for filename in os.listdir(HOT_MOMENTS_DIR):
+        if filename.endswith(".json"):
+            # 파일명에서 날짜 추출 (YYYY-MM-DD.json)
+            date = filename.replace(".json", "")
+            files.append(date)
+    
+    # 날짜 내림차순 정렬 (최신순)
+    files.sort(reverse=True)
+    
+    return HistoryListResponse(
+        available_dates=files,
+        total_files=len(files)
+    )
+
+
+def _load_history_file(date: str) -> DailyHistoryResponse:
+    """특정 날짜의 히스토리 파일을 로드합니다."""
+    import os
+    
+    filepath = os.path.join(HOT_MOMENTS_DIR, f"{date}.json")
+    
+    if not os.path.exists(filepath):
+        return DailyHistoryResponse(
+            date=date,
+            last_updated=None,
+            sessions=[]
+        )
+    
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        sessions = []
+        for session_data in data.get("sessions", []):
+            hot_moments = [
+                HotMomentFileResponse(
+                    time=hm["time"],
+                    count=hm["count"],
+                    description=hm["description"],
+                    detected_memes=hm.get("detected_memes", [])
+                )
+                for hm in session_data.get("hot_moments", [])
+            ]
+            
+            sessions.append(SessionResponse(
+                broadcast_title=session_data.get("broadcast_title", ""),
+                saved_at=session_data.get("saved_at", ""),
+                hot_moments=hot_moments
+            ))
+        
+        return DailyHistoryResponse(
+            date=data.get("date", date),
+            last_updated=data.get("last_updated"),
+            sessions=sessions
+        )
+    
+    except (json.JSONDecodeError, IOError):
+        return DailyHistoryResponse(
+            date=date,
+            last_updated=None,
+            sessions=[]
+        )
 
 
 # 앱 인스턴스 생성
