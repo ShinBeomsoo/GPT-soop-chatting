@@ -618,8 +618,8 @@ class ChatMessageParser:
 @dataclass
 class HotMomentConfig:
     """Hot Moment 감지 설정"""
-    window_seconds: int = 30
-    threshold_count: int = 10
+    window_seconds: int = 10 
+    threshold_count: int = 20
     cooldown_seconds: int = 60
     max_history: int = 100
     data_directory: str = "data/hot_moments"
@@ -764,7 +764,8 @@ class HotMomentDetector:
     ) -> HotMoment:
         """Hot Moment 객체를 생성합니다."""
         meme_names = ", ".join(detected_memes) if detected_memes else "알 수 없음"
-        description = f"30초간 {density}회 [{meme_names}] 폭주!"
+        window = self._config.window_seconds
+        description = f"{window}초간 {density}회 [{meme_names}] 폭주!"
         
         return HotMoment(
             time=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
@@ -791,7 +792,8 @@ class HotMomentDetector:
         """Hot Moment 로그를 출력합니다."""
         time_str = timestamp.strftime("%H:%M:%S")
         meme_names = ", ".join(detected_memes) if detected_memes else "알 수 없음"
-        print(f"🔥 [HOT] {time_str} - 30초간 {density}회 [{meme_names}] 감지됨!")
+        window = self._config.window_seconds
+        print(f"🔥 [HOT] {time_str} - {window}초간 {density}회 [{meme_names}] 감지됨!")
     
     # ==================== JSON 파일 저장/로드 ====================
     
