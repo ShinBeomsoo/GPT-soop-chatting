@@ -7,7 +7,7 @@ SOOP 지피티 채팅 모니터링 봇
 
 주요 기능:
 - 방송 상태 자동 감지 (온/오프라인)
-- 밈 패턴 실시간 감지 (지창, 세신, 짜장면, ㄷㅈㄹㄱ)
+- 밈 패턴 실시간 감지 (지창, 세신, 짜장면, ㄷㅈㄹㄱ, ㅆㄷㄴ)
 - Wave(물타기) 현상 추적
 - Hot Moment(급증 구간) 감지
 - REST API를 통한 통계 조회
@@ -22,10 +22,9 @@ import ssl
 import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
-from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Deque, Optional
+from datetime import datetime
+from typing import Optional, Protocol
 
 import uvicorn
 import websockets
@@ -65,7 +64,23 @@ MEME_PATTERNS = (
     MemePattern("sesin", "세신", r"세[ㅡ\s~-]*신"),
     MemePattern("jjajang", "짜장면", r"짜[ㅡ\s~-]*장[ㅡ\s~-]*면"),
     MemePattern("djrg", "ㄷㅈㄹㄱ", r"ㄷ[ㅡ\s~-]*ㅈ[ㅡ\s~-]*ㄹ[ㅡ\s~-]*ㄱ"),
+    # ㅆㄷㄴ / 쌋다나 / 쌌다나
+    MemePattern(
+        "sdn",
+        "ㅆㄷㄴ",
+        r"(?:ㅆ[ㅡ\s~-]*ㄷ[ㅡ\s~-]*ㄴ|쌋[ㅡ\s~-]*다[ㅡ\s~-]*나|쌌[ㅡ\s~-]*다[ㅡ\s~-]*나)"
+    ),
 )
+
+
+def _extract_date_from_start_time(start_time: Optional[str]) -> str:
+    """시작 시간 문자열에서 날짜(YYYY-MM-DD)를 추출합니다. 없으면 오늘 날짜 반환."""
+    if start_time:
+        try:
+            return start_time.split(" ")[0]
+        except (AttributeError, IndexError):
+            pass
+    return datetime.now().strftime("%Y-%m-%d")
 
 
 # ==============================================================================
@@ -104,6 +119,7 @@ class BroadcastHistoryResponse(BaseModel):
     total_sesin: int = 0
     total_jjajang: int = 0
     total_djrg: int = 0
+    total_sdn: int = 0
 
 
 class StatsResponse(BaseModel):
@@ -125,6 +141,9 @@ class StatsResponse(BaseModel):
     djrg_wave_count: int
     total_djrg_chat_count: int
     
+    sdn_wave_count: int
+    total_sdn_chat_count: int
+    
     last_detected_at: Optional[datetime] = None
     hot_moments: list[HotMomentResponse] = []
     history: list[BroadcastHistoryResponse] = []
@@ -143,6 +162,12 @@ class SessionResponse(BaseModel):
     broadcast_title: str
     saved_at: str
     hot_moments: list[HotMomentFileResponse]
+    # 세션별 밈 총 감지 횟수
+    total_ji_chang: int = 0
+    total_sesin: int = 0
+    total_jjajang: int = 0
+    total_djrg: int = 0
+    total_sdn: int = 0
 
 
 class DailyHistoryResponse(BaseModel):
@@ -150,6 +175,12 @@ class DailyHistoryResponse(BaseModel):
     date: str
     last_updated: Optional[str] = None
     sessions: list[SessionResponse] = []
+    # 해당 날짜 전체 밈 총 감지 횟수 (모든 세션 합계)
+    total_ji_chang: int = 0
+    total_sesin: int = 0
+    total_jjajang: int = 0
+    total_djrg: int = 0
+    total_sdn: int = 0
 
 
 class HistoryListResponse(BaseModel):
@@ -194,6 +225,13 @@ class HotMoment:
     detected_memes: list[str] = field(default_factory=list)  # 감지된 밈 목록
 
 
+class HotMomentRecorder(Protocol):
+    """Hot Moment 기록 추상화 (DIP: 핸들러가 구체 클래스가 아닌 이 인터페이스에 의존)"""
+    def record_wave_as_hot_moment(
+        self, timestamp: datetime, meme_name: str, count: int
+    ) -> HotMoment: ...
+
+
 @dataclass
 class BroadcastHistory:
     """방송 기록 데이터 클래스"""
@@ -203,6 +241,7 @@ class BroadcastHistory:
     sesin_waves: int
     jjajang_waves: int
     djrg_waves: int
+    sdn_waves: int
 
 
 # ==============================================================================
@@ -212,8 +251,8 @@ class BroadcastHistory:
 @dataclass
 class WaveDetectionConfig:
     """웨이브 감지 설정"""
-    min_duration_seconds: float = 10.0
-    min_message_count: int = 20
+    min_duration_seconds: float = 20.0  # 20초간
+    min_message_count: int = 20  # 20개 이상 시 Wave
     gap_timeout_seconds: float = 10.0
     cooldown_seconds: float = 60.0  # Wave 확정 후 쿨다운
 
@@ -225,14 +264,14 @@ class MemeScanner:
     Wave란?
     -------
     채팅에서 특정 밈이 연속적으로 등장하는 현상입니다.
-    10초 이상 지속되고 20개 이상의 메시지가 감지되면 하나의 Wave로 카운트됩니다.
+    20초간 20개 이상의 메시지가 감지되면 하나의 Wave로 카운트됩니다.
     """
     
     __slots__ = (
         "_pattern", "_config", "_compiled_regex",
         "_wave_count", "_total_count",
         "_streak_start", "_streak_last", "_streak_count", "_streak_confirmed",
-        "_last_wave_time"  # 웨이브 쿨다운용
+        "_last_wave_time", "_wave_just_confirmed"  # 웨이브 쿨다운용, Wave→Hot Moment 전달용
     )
     
     def __init__(
@@ -254,6 +293,7 @@ class MemeScanner:
         self._streak_count = 0
         self._streak_confirmed = False
         self._last_wave_time: Optional[datetime] = None  # 마지막 Wave 확정 시간
+        self._wave_just_confirmed: Optional[tuple[datetime, int]] = None  # (timestamp, count) Wave→Hot Moment
     
     @property
     def key(self) -> str:
@@ -284,6 +324,7 @@ class MemeScanner:
         self._streak_last = None
         self._streak_count = 0
         self._streak_confirmed = False
+        self._wave_just_confirmed = None
     
     def process_message(self, message: str, timestamp: datetime) -> bool:
         """
@@ -352,7 +393,14 @@ class MemeScanner:
             self._wave_count += 1
             self._streak_confirmed = True
             self._last_wave_time = timestamp
+            self._wave_just_confirmed = (timestamp, self._streak_count)
             self._log_wave_confirmed()
+    
+    def pop_wave_just_confirmed(self) -> Optional[tuple[datetime, int]]:
+        """방금 확정된 Wave가 있으면 (timestamp, count)를 반환하고 초기화합니다. (Hot Moment 기록용)"""
+        out = self._wave_just_confirmed
+        self._wave_just_confirmed = None
+        return out
     
     def _is_cooldown_passed(self, timestamp: datetime) -> bool:
         """웨이브 쿨다운이 지났는지 확인합니다."""
@@ -364,7 +412,7 @@ class MemeScanner:
     
     def _log_wave_confirmed(self) -> None:
         """Wave 확정 로그를 출력합니다."""
-        print(f"🌊 [WAVE] {self.display_name} 10초 지속 확정! (시즌 {self._wave_count}회)")
+        print(f"🌊 [WAVE] {self.display_name} 20초간 {self._streak_count}회 확정! (시즌 {self._wave_count}회)")
 
 
 # ==============================================================================
@@ -477,11 +525,28 @@ class BroadcastStatusService:
         if not broadcast_data:
             return None
         
+        start_time = self._extract_broadcast_start_time(broadcast_data)
         return BroadcastInfo(
             broadcast_no=broadcast_data["broad_no"],
             title=broadcast_data["broad_title"],
-            start_time=broadcast_data.get("broad_start")
+            start_time=start_time
         )
+    
+    def _extract_broadcast_start_time(self, broadcast_data: dict) -> Optional[str]:
+        """방송 데이터에서 시작 시간 문자열을 추출합니다. 여러 API 필드명을 시도합니다."""
+        for key in ("broad_start", "broad_start_time", "start_time"):
+            value = broadcast_data.get(key)
+            if value is None:
+                continue
+            if isinstance(value, (int, float)):
+                try:
+                    dt = datetime.fromtimestamp(int(value))
+                    return dt.strftime("%Y-%m-%d %H:%M:%S")
+                except (OSError, ValueError):
+                    continue
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
 
 
 # ==============================================================================
@@ -662,32 +727,24 @@ class ChatMessageParser:
 
 @dataclass
 class HotMomentConfig:
-    """Hot Moment 감지 설정"""
-    window_seconds: int = 10 
-    threshold_count: int = 20
-    cooldown_seconds: int = 60  # 60초 쿨다운 (Wave와 동일)
+    """Hot Moment 저장/표시 설정 (Wave 확정 시 1건 = 1 Hot Moment)"""
     max_history: int = 100
     data_directory: str = "data/hot_moments"
 
 
 class HotMomentDetector:
     """
-    채팅 급증 구간(Hot Moment)을 감지합니다.
+    Hot Moment를 기록·저장합니다. (단일 책임: Wave 확정 시 Hot Moment 기록 + 파일 저장)
     
-    일정 시간 내에 특정 횟수 이상의 밈이 감지되면 Hot Moment로 기록합니다.
-    방송 종료 시 날짜별 JSON 파일로 저장됩니다.
+    하나의 Wave = 하나의 Hot Moment. Wave 확정 시 record_wave_as_hot_moment로만 기록됩니다.
     """
     
-    __slots__ = ("_config", "_timestamps", "_hot_moments", "_last_hot_time", "_recent_memes")
+    __slots__ = ("_config", "_hot_moments", "_last_hot_time")
     
     def __init__(self, config: HotMomentConfig | None = None) -> None:
         self._config = config or HotMomentConfig()
-        self._timestamps: Deque[datetime] = deque()
         self._hot_moments: list[HotMoment] = []
         self._last_hot_time: Optional[datetime] = None
-        self._recent_memes: Deque[tuple[datetime, list[str]]] = deque()  # (시간, 밈목록) 쌍
-        
-        # 데이터 디렉토리 생성
         self._ensure_data_directory()
     
     def _ensure_data_directory(self) -> None:
@@ -701,123 +758,8 @@ class HotMomentDetector:
     
     def reset(self) -> None:
         """상태를 초기화합니다."""
-        self._timestamps.clear()
         self._hot_moments.clear()
         self._last_hot_time = None
-        self._recent_memes.clear()
-    
-    def record_detection(
-        self, 
-        timestamp: datetime, 
-        detected_memes: list[str]
-    ) -> Optional[HotMoment]:
-        """
-        밈 감지를 기록하고 Hot Moment 여부를 확인합니다.
-        
-        Args:
-            timestamp: 감지 시간
-            detected_memes: 감지된 밈 이름 목록
-            
-        Returns:
-            Hot Moment가 생성되면 해당 객체, 아니면 None
-        """
-        self._add_timestamp(timestamp)
-        self._add_meme_record(timestamp, detected_memes)
-        self._remove_expired_timestamps(timestamp)
-        self._remove_expired_meme_records(timestamp)
-        
-        return self._check_and_create_hot_moment(timestamp)
-    
-    def _add_timestamp(self, timestamp: datetime) -> None:
-        """타임스탬프를 추가합니다."""
-        self._timestamps.append(timestamp)
-    
-    def _add_meme_record(self, timestamp: datetime, detected_memes: list[str]) -> None:
-        """밈 감지 기록을 추가합니다."""
-        self._recent_memes.append((timestamp, detected_memes))
-    
-    def _remove_expired_timestamps(self, current_time: datetime) -> None:
-        """만료된 타임스탬프를 제거합니다."""
-        cutoff = current_time - timedelta(seconds=self._config.window_seconds)
-        while self._timestamps and self._timestamps[0] < cutoff:
-            self._timestamps.popleft()
-    
-    def _remove_expired_meme_records(self, current_time: datetime) -> None:
-        """만료된 밈 기록을 제거합니다."""
-        cutoff = current_time - timedelta(seconds=self._config.window_seconds)
-        while self._recent_memes and self._recent_memes[0][0] < cutoff:
-            self._recent_memes.popleft()
-    
-    def _get_meme_counts(self) -> dict[str, int]:
-        """최근 윈도우 내의 밈별 감지 횟수를 계산합니다."""
-        meme_counts: dict[str, int] = {}
-        for _, memes in self._recent_memes:
-            for meme in memes:
-                meme_counts[meme] = meme_counts.get(meme, 0) + 1
-        return meme_counts
-    
-    def _get_triggered_memes(self) -> list[str]:
-        """threshold 이상 감지된 밈 목록을 반환합니다."""
-        meme_counts = self._get_meme_counts()
-        # 각 밈이 threshold 이상 감지되어야 포함
-        triggered = [
-            meme for meme, count in meme_counts.items() 
-            if count >= self._config.threshold_count
-        ]
-        # 감지 횟수 내림차순 정렬
-        triggered.sort(key=lambda m: meme_counts[m], reverse=True)
-        return triggered
-    
-    def _check_and_create_hot_moment(
-        self, 
-        timestamp: datetime
-    ) -> Optional[HotMoment]:
-        """Hot Moment 조건을 확인하고 생성합니다."""
-        # 쿨다운 체크
-        if not self._is_cooldown_passed(timestamp):
-            return None
-        
-        # 개별 밈 중 threshold 이상 감지된 밈 확인
-        triggered_memes = self._get_triggered_memes()
-        
-        if not triggered_memes:
-            return None
-        
-        # 해당 밈들의 총 감지 횟수 계산
-        meme_counts = self._get_meme_counts()
-        total_count = sum(meme_counts.get(meme, 0) for meme in triggered_memes)
-        
-        hot_moment = self._create_hot_moment(timestamp, total_count, triggered_memes)
-        self._record_hot_moment(hot_moment, timestamp)
-        self._log_hot_moment(timestamp, total_count, triggered_memes)
-        
-        return hot_moment
-    
-    def _is_cooldown_passed(self, timestamp: datetime) -> bool:
-        """쿨다운이 지났는지 확인합니다."""
-        if self._last_hot_time is None:
-            return True
-        
-        time_since_last = (timestamp - self._last_hot_time).total_seconds()
-        return time_since_last > self._config.cooldown_seconds
-    
-    def _create_hot_moment(
-        self, 
-        timestamp: datetime, 
-        density: int, 
-        detected_memes: list[str]
-    ) -> HotMoment:
-        """Hot Moment 객체를 생성합니다."""
-        meme_names = ", ".join(detected_memes) if detected_memes else "알 수 없음"
-        window = self._config.window_seconds
-        description = f"{window}초간 {density}회 [{meme_names}] 폭주!"
-        
-        return HotMoment(
-            time=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-            count=density,
-            description=description,
-            detected_memes=detected_memes
-        )
     
     def _record_hot_moment(self, hot_moment: HotMoment, timestamp: datetime) -> None:
         """Hot Moment를 기록합니다."""
@@ -837,8 +779,28 @@ class HotMomentDetector:
         """Hot Moment 로그를 출력합니다."""
         time_str = timestamp.strftime("%H:%M:%S")
         meme_names = ", ".join(detected_memes) if detected_memes else "알 수 없음"
-        window = self._config.window_seconds
-        print(f"🔥 [HOT] {time_str} - {window}초간 {density}회 [{meme_names}] 감지됨!")
+        print(f"🔥 [HOT] {time_str} - 20초간 {density}회 [{meme_names}] 감지됨!")
+    
+    def record_wave_as_hot_moment(
+        self, 
+        timestamp: datetime, 
+        meme_name: str, 
+        count: int
+    ) -> HotMoment:
+        """
+        Wave 확정 시 하나의 Hot Moment로 기록합니다. (하나의 Wave = 하나의 Hot Moment)
+        """
+        duration_sec = 20  # Wave 조건과 동일
+        description = f"{duration_sec}초간 {count}회 [{meme_name}] 폭주!"
+        hot_moment = HotMoment(
+            time=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            count=count,
+            description=description,
+            detected_memes=[meme_name]
+        )
+        self._record_hot_moment(hot_moment, timestamp)
+        self._log_hot_moment(timestamp, count, [meme_name])
+        return hot_moment
     
     # ==================== JSON 파일 저장/로드 ====================
     
@@ -847,25 +809,31 @@ class HotMomentDetector:
         import os
         return os.path.join(self._config.data_directory, f"{date_str}.json")
     
-    def save_to_file(self, broadcast_title: str, start_time: Optional[str] = None) -> None:
+    def save_to_file(
+        self,
+        broadcast_title: str,
+        start_time: Optional[str] = None,
+        meme_totals: Optional[dict[str, int]] = None
+    ) -> None:
         """
         현재 세션의 hot_moments를 날짜별 JSON 파일에 저장합니다.
         
         Args:
             broadcast_title: 방송 제목
             start_time: 방송 시작 시간 (날짜 추출용)
+            meme_totals: 세션별 밈 총 감지 횟수 (ji_chang, sesin, jjajang, djrg, sdn)
         """
         if not self._hot_moments:
             print("📝 저장할 Hot Moment가 없습니다.")
             return
         
-        # 날짜 추출
-        date_str = self._extract_date(start_time)
+        date_str = _extract_date_from_start_time(start_time)
         filepath = self._get_json_filepath(date_str)
         
         # 기존 데이터 로드 (있으면)
         existing_data = self._load_json_file(filepath)
         
+        totals = meme_totals or {}
         # 새 방송 세션 데이터 생성
         session_data = {
             "broadcast_title": broadcast_title,
@@ -878,7 +846,12 @@ class HotMomentDetector:
                     "detected_memes": moment.detected_memes
                 }
                 for moment in self._hot_moments
-            ]
+            ],
+            "total_ji_chang": totals.get("ji_chang", 0),
+            "total_sesin": totals.get("sesin", 0),
+            "total_jjajang": totals.get("jjajang", 0),
+            "total_djrg": totals.get("djrg", 0),
+            "total_sdn": totals.get("sdn", 0),
         }
         
         # 기존 데이터에 새 세션 추가
@@ -892,15 +865,6 @@ class HotMomentDetector:
         # 파일에 저장
         self._save_json_file(filepath, existing_data)
         print(f"💾 Hot Moments 저장 완료: {filepath} ({len(self._hot_moments)}개)")
-    
-    def _extract_date(self, start_time: Optional[str]) -> str:
-        """시작 시간에서 날짜를 추출합니다."""
-        if start_time:
-            try:
-                return start_time.split(" ")[0]
-            except (AttributeError, IndexError):
-                pass
-        return datetime.now().strftime("%Y-%m-%d")
     
     def _load_json_file(self, filepath: str) -> dict:
         """JSON 파일을 로드합니다. 파일이 없으면 빈 dict를 반환합니다."""
@@ -957,7 +921,7 @@ class BroadcastHistoryManager:
             start_time: 방송 시작 시간 문자열
             scanners: 밈 스캐너 딕셔너리
         """
-        date_str = self._extract_date(start_time)
+        date_str = _extract_date_from_start_time(start_time)
         
         record = BroadcastHistory(
             date=date_str,
@@ -965,20 +929,12 @@ class BroadcastHistoryManager:
             ji_chang_waves=scanners["ji_chang"].wave_count,
             sesin_waves=scanners["sesin"].wave_count,
             jjajang_waves=scanners["jjajang"].wave_count,
-            djrg_waves=scanners["djrg"].wave_count
+            djrg_waves=scanners["djrg"].wave_count,
+            sdn_waves=scanners["sdn"].wave_count
         )
         
         self._add_record(record)
         self._log_saved(date_str, scanners["ji_chang"].wave_count)
-    
-    def _extract_date(self, start_time: Optional[str]) -> str:
-        """시작 시간에서 날짜를 추출합니다."""
-        if start_time:
-            try:
-                return start_time.split(" ")[0]
-            except (AttributeError, IndexError):
-                pass
-        return datetime.now().strftime("%Y-%m-%d")
     
     def _add_record(self, record: BroadcastHistory) -> None:
         """기록을 추가하고 최대 개수를 유지합니다."""
@@ -1066,19 +1022,17 @@ class PollingStrategy:
 # ==============================================================================
 
 class ChatWebSocketHandler:
-    """WebSocket을 통한 채팅 연결을 관리합니다."""
+    """WebSocket을 통한 채팅 연결을 관리합니다. (DIP: HotMomentRecorder 프로토콜에 의존)"""
     
     PING_INTERVAL_SECONDS = 20
     
     def __init__(
         self,
         scanners: dict[str, MemeScanner],
-        hot_moment_detector: HotMomentDetector,
-        on_meme_detected: Optional[callable] = None
+        hot_moment_recorder: HotMomentRecorder,
     ) -> None:
         self._scanners = scanners
-        self._hot_moment_detector = hot_moment_detector
-        self._on_meme_detected = on_meme_detected
+        self._hot_moment_recorder = hot_moment_recorder
         self._last_detected_at: Optional[datetime] = None
     
     @property
@@ -1172,7 +1126,13 @@ class ChatWebSocketHandler:
         
         if detected_memes:
             self._last_detected_at = now
-            self._hot_moment_detector.record_detection(now, detected_memes)
+        
+        # 하나의 Wave = 하나의 Hot Moment: Wave 확정 시 Hot Moment로 기록
+        for scanner in self._scanners.values():
+            wave_info = scanner.pop_wave_just_confirmed()
+            if wave_info is not None:
+                ts, count = wave_info
+                self._hot_moment_recorder.record_wave_as_hot_moment(ts, scanner.display_name, count)
     
     def _process_with_scanners(self, message: str, timestamp: datetime) -> list[str]:
         """모든 스캐너로 메시지를 처리하고 감지된 밈 목록을 반환합니다."""
@@ -1337,7 +1297,11 @@ class AutoMonitorBot:
         self._state.is_live = True
         self._state.current_broadcast_no = broadcast_info.broadcast_no
         self._state.broadcast_title = broadcast_info.title
-        self._state.broadcast_start_time = broadcast_info.start_time
+        # API에서 시작 시간이 없으면 세션 시작 시각을 사용 (started_at이 null이 되지 않도록)
+        self._state.broadcast_start_time = (
+            broadcast_info.start_time
+            or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
     
     def _reset_session_data(self) -> None:
         """세션 데이터를 초기화합니다."""
@@ -1375,10 +1339,12 @@ class AutoMonitorBot:
             self._scanners
         )
         
-        # Hot Moments JSON 파일로 저장
+        # Hot Moments JSON 파일로 저장 (밈별 총 횟수 포함)
+        meme_totals = {key: scanner.total_count for key, scanner in self._scanners.items()}
         self._hot_moment_detector.save_to_file(
             self._state.broadcast_title,
-            self._state.broadcast_start_time
+            self._state.broadcast_start_time,
+            meme_totals=meme_totals
         )
     
     def _reset_state(self) -> None:
@@ -1454,6 +1420,9 @@ def _build_stats_response(bot: AutoMonitorBot) -> StatsResponse:
         djrg_wave_count=bot.scanners["djrg"].wave_count,
         total_djrg_chat_count=bot.scanners["djrg"].total_count,
         
+        sdn_wave_count=bot.scanners["sdn"].wave_count,
+        total_sdn_chat_count=bot.scanners["sdn"].total_count,
+        
         last_detected_at=bot.last_detected_at,
         hot_moments=[
             HotMomentResponse(
@@ -1470,7 +1439,8 @@ def _build_stats_response(bot: AutoMonitorBot) -> StatsResponse:
                 total_ji_chang=record.ji_chang_waves,
                 total_sesin=record.sesin_waves,
                 total_jjajang=record.jjajang_waves,
-                total_djrg=record.djrg_waves
+                total_djrg=record.djrg_waves,
+                total_sdn=record.sdn_waves
             )
             for record in bot.history
         ]
@@ -1522,6 +1492,7 @@ def _load_history_file(date: str) -> DailyHistoryResponse:
             data = json.load(f)
         
         sessions = []
+        daily_ji_chang = daily_sesin = daily_jjajang = daily_djrg = daily_sdn = 0
         for session_data in data.get("sessions", []):
             hot_moments = [
                 HotMomentFileResponse(
@@ -1532,17 +1503,36 @@ def _load_history_file(date: str) -> DailyHistoryResponse:
                 )
                 for hm in session_data.get("hot_moments", [])
             ]
-            
+            sj = session_data.get("total_ji_chang", 0)
+            ss = session_data.get("total_sesin", 0)
+            sjj = session_data.get("total_jjajang", 0)
+            sd = session_data.get("total_djrg", 0)
+            sn = session_data.get("total_sdn", 0)
+            daily_ji_chang += sj
+            daily_sesin += ss
+            daily_jjajang += sjj
+            daily_djrg += sd
+            daily_sdn += sn
             sessions.append(SessionResponse(
                 broadcast_title=session_data.get("broadcast_title", ""),
                 saved_at=session_data.get("saved_at", ""),
-                hot_moments=hot_moments
+                hot_moments=hot_moments,
+                total_ji_chang=sj,
+                total_sesin=ss,
+                total_jjajang=sjj,
+                total_djrg=sd,
+                total_sdn=sn
             ))
         
         return DailyHistoryResponse(
             date=data.get("date", date),
             last_updated=data.get("last_updated"),
-            sessions=sessions
+            sessions=sessions,
+            total_ji_chang=daily_ji_chang,
+            total_sesin=daily_sesin,
+            total_jjajang=daily_jjajang,
+            total_djrg=daily_djrg,
+            total_sdn=daily_sdn
         )
     
     except (json.JSONDecodeError, IOError):
