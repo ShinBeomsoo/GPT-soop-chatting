@@ -48,7 +48,7 @@ SOOP(아프리카TV) 방송의 채팅을 실시간으로 모니터링하여 밈 
 | `GET /health`         | 헬스체크                                                   |
 | `GET /stats`          | 현재 세션 통계 조회 (밈별 Wave/총 감지 횟수, Hot Moments, 방송 기록) |
 | `GET /history`        | Hot Moments가 저장된 날짜 목록 조회 (`data/hot_moments/` 기준) |
-| `GET /history/{date}` | 특정 날짜 Hot Moments 조회 (세션별·날짜별 밈 총 횟수 포함) |
+| `GET /history/{date}` | 특정 날짜 Hot Moments 조회 (Wave 확정 시점 + 세션별·날짜별 밈 총 횟수) |
 
 ### `/stats` 응답 필드
 
@@ -57,7 +57,7 @@ SOOP(아프리카TV) 방송의 채팅을 실시간으로 모니터링하여 밈 
 - 밈별: `ji_chang_wave_count`, `total_ji_chang_chat_count`, `sesin_*`, `jjajang_*`, `djrg_*`, `sdn_*`
 - `last_detected_at`: 마지막 밈 감지 시각
 - `hot_moments`: 현재 세션의 Hot Moment 목록 (Wave 확정 시점)
-- `history`: 메모리 상 방송 기록 (날짜, 제목, 밈별 Wave 횟수 `total_ji_chang`~`total_sdn`)
+- `history`: 메모리 상 방송 기록 (`broadcast_title`, 밈별 Wave 횟수 `total_*_wave_count`)
 
 ### `/stats` 응답 예시
 
@@ -81,12 +81,12 @@ SOOP(아프리카TV) 방송의 채팅을 실시간으로 모니터링하여 밈 
   "history": [
     {
       "date": "2026-02-07",
-      "title": "방송 제목",
-      "total_ji_chang": 7,
-      "total_sesin": 0,
-      "total_jjajang": 0,
-      "total_djrg": 0,
-      "total_sdn": 0
+      "broadcast_title": "방송 제목",
+      "total_ji_chang_wave_count": 7,
+      "total_sesin_wave_count": 0,
+      "total_jjajang_wave_count": 0,
+      "total_djrg_wave_count": 0,
+      "total_sdn_wave_count": 0
     }
   ]
 }
@@ -95,9 +95,11 @@ SOOP(아프리카TV) 방송의 채팅을 실시간으로 모니터링하여 밈 
 ### `/history/{date}` 응답 구조
 
 - `date`, `last_updated`: 조회 날짜, 파일 마지막 수정 시각
-- `sessions`: 해당 날짜에 저장된 방송 세션 목록
-  - 각 세션: `broadcast_title`, `saved_at`, `hot_moments`, `total_ji_chang`, `total_sesin`, `total_jjajang`, `total_djrg`, `total_sdn`
-- `total_ji_chang`, `total_sesin`, `total_jjajang`, `total_djrg`, `total_sdn`: 해당 날짜 전체 합계(모든 세션)
+- `sessions`: 해당 날짜에 저장된 방송 세션 목록 (배열: 복수형)
+  - 각 세션: `broadcast_title`, `saved_at`, `hot_moments`, `total_ji_chang_wave_count`, `total_sesin_wave_count`, `total_jjajang_wave_count`, `total_djrg_wave_count`, `total_sdn_wave_count`
+- `total_*_wave_count`: 해당 날짜 전체 Wave 횟수 합계(모든 세션)
+
+**Hot Moment = Wave 확정 시점**이므로, `hot_moments`에는 20초간 20개 이상 감지되어 Wave가 확정된 순간들이 담깁니다.
 
 ---
 

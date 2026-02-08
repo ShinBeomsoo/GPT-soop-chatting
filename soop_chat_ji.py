@@ -51,7 +51,7 @@ class MemePattern:
 
 
 # 앱 설정 상수
-TARGET_BROADCASTER = BroadcasterConfig(id="cnsgkcnehd74", name="조경훈")
+TARGET_BROADCASTER = BroadcasterConfig(id="tjrdbs999", name="지피티")
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -105,21 +105,22 @@ class ChatProtocol:
 # ==============================================================================
 
 class HotMomentResponse(BaseModel):
-    """Hot Moment(급증 구간) 응답 모델"""
+    """Hot Moment(급증 구간) 응답 모델 (배열 필드: 복수형 detected_memes)"""
     time: str
     count: int
     description: str
+    detected_memes: list[str] = []
 
 
 class BroadcastHistoryResponse(BaseModel):
-    """방송 기록 응답 모델"""
+    """방송 기록 응답 모델 (API/JSON 키: snake_case, 명확한 이름)"""
     date: str
-    title: str
-    total_ji_chang: int
-    total_sesin: int = 0
-    total_jjajang: int = 0
-    total_djrg: int = 0
-    total_sdn: int = 0
+    broadcast_title: str
+    total_ji_chang_wave_count: int
+    total_sesin_wave_count: int = 0
+    total_jjajang_wave_count: int = 0
+    total_djrg_wave_count: int = 0
+    total_sdn_wave_count: int = 0
 
 
 class StatsResponse(BaseModel):
@@ -158,16 +159,15 @@ class HotMomentFileResponse(BaseModel):
 
 
 class SessionResponse(BaseModel):
-    """방송 세션 응답 모델"""
+    """방송 세션 응답 모델 (API/JSON 키: snake_case)"""
     broadcast_title: str
     saved_at: str
     hot_moments: list[HotMomentFileResponse]
-    # 세션별 밈 총 감지 횟수
-    total_ji_chang: int = 0
-    total_sesin: int = 0
-    total_jjajang: int = 0
-    total_djrg: int = 0
-    total_sdn: int = 0
+    total_ji_chang_wave_count: int = 0
+    total_sesin_wave_count: int = 0
+    total_jjajang_wave_count: int = 0
+    total_djrg_wave_count: int = 0
+    total_sdn_wave_count: int = 0
 
 
 class DailyHistoryResponse(BaseModel):
@@ -175,18 +175,17 @@ class DailyHistoryResponse(BaseModel):
     date: str
     last_updated: Optional[str] = None
     sessions: list[SessionResponse] = []
-    # 해당 날짜 전체 밈 총 감지 횟수 (모든 세션 합계)
-    total_ji_chang: int = 0
-    total_sesin: int = 0
-    total_jjajang: int = 0
-    total_djrg: int = 0
-    total_sdn: int = 0
+    total_ji_chang_wave_count: int = 0
+    total_sesin_wave_count: int = 0
+    total_jjajang_wave_count: int = 0
+    total_djrg_wave_count: int = 0
+    total_sdn_wave_count: int = 0
 
 
 class HistoryListResponse(BaseModel):
-    """히스토리 목록 응답 모델"""
+    """히스토리 목록 응답 모델 (배열: 복수형, 개수: *_count)"""
     available_dates: list[str]
-    total_files: int
+    total_file_count: int
 
 
 # ==============================================================================
@@ -848,15 +847,15 @@ class HotMomentDetector:
                     "time": moment.time,
                     "count": moment.count,
                     "description": moment.description,
-                    "detected_memes": moment.detected_memes
+                    "detected_memes": moment.detected_memes,
                 }
                 for moment in self._hot_moments
             ],
-            "total_ji_chang": totals.get("ji_chang", 0),
-            "total_sesin": totals.get("sesin", 0),
-            "total_jjajang": totals.get("jjajang", 0),
-            "total_djrg": totals.get("djrg", 0),
-            "total_sdn": totals.get("sdn", 0),
+            "total_ji_chang_wave_count": totals.get("ji_chang", 0),
+            "total_sesin_wave_count": totals.get("sesin", 0),
+            "total_jjajang_wave_count": totals.get("jjajang", 0),
+            "total_djrg_wave_count": totals.get("djrg", 0),
+            "total_sdn_wave_count": totals.get("sdn", 0),
         }
         
         # 기존 데이터에 새 세션 추가
@@ -1433,19 +1432,20 @@ def _build_stats_response(bot: AutoMonitorBot) -> StatsResponse:
             HotMomentResponse(
                 time=moment.time,
                 count=moment.count,
-                description=moment.description
+                description=moment.description,
+                detected_memes=moment.detected_memes,
             )
             for moment in bot.hot_moments
         ],
         history=[
             BroadcastHistoryResponse(
                 date=record.date,
-                title=record.title,
-                total_ji_chang=record.ji_chang_waves,
-                total_sesin=record.sesin_waves,
-                total_jjajang=record.jjajang_waves,
-                total_djrg=record.djrg_waves,
-                total_sdn=record.sdn_waves
+                broadcast_title=record.title,
+                total_ji_chang_wave_count=record.ji_chang_waves,
+                total_sesin_wave_count=record.sesin_waves,
+                total_jjajang_wave_count=record.jjajang_waves,
+                total_djrg_wave_count=record.djrg_waves,
+                total_sdn_wave_count=record.sdn_waves,
             )
             for record in bot.history
         ]
@@ -1461,21 +1461,19 @@ def _get_available_history_dates() -> HistoryListResponse:
     import os
     
     if not os.path.exists(HOT_MOMENTS_DIR):
-        return HistoryListResponse(available_dates=[], total_files=0)
+        return HistoryListResponse(available_dates=[], total_file_count=0)
     
     files = []
     for filename in os.listdir(HOT_MOMENTS_DIR):
         if filename.endswith(".json"):
-            # 파일명에서 날짜 추출 (YYYY-MM-DD.json)
             date = filename.replace(".json", "")
             files.append(date)
     
-    # 날짜 내림차순 정렬 (최신순)
     files.sort(reverse=True)
     
     return HistoryListResponse(
         available_dates=files,
-        total_files=len(files)
+        total_file_count=len(files)
     )
 
 
@@ -1496,6 +1494,10 @@ def _load_history_file(date: str) -> DailyHistoryResponse:
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
         
+        def _get_wave_count(s: dict, key: str) -> int:
+            """새 키(total_*_wave_count) 우선, 구 키(total_*) 하위 호환."""
+            return s.get(f"total_{key}_wave_count", s.get(f"total_{key}", 0))
+
         sessions = []
         daily_ji_chang = daily_sesin = daily_jjajang = daily_djrg = daily_sdn = 0
         for session_data in data.get("sessions", []):
@@ -1504,15 +1506,15 @@ def _load_history_file(date: str) -> DailyHistoryResponse:
                     time=hm["time"],
                     count=hm["count"],
                     description=hm["description"],
-                    detected_memes=hm.get("detected_memes", [])
+                    detected_memes=hm.get("detected_memes", []),
                 )
                 for hm in session_data.get("hot_moments", [])
             ]
-            sj = session_data.get("total_ji_chang", 0)
-            ss = session_data.get("total_sesin", 0)
-            sjj = session_data.get("total_jjajang", 0)
-            sd = session_data.get("total_djrg", 0)
-            sn = session_data.get("total_sdn", 0)
+            sj = _get_wave_count(session_data, "ji_chang")
+            ss = _get_wave_count(session_data, "sesin")
+            sjj = _get_wave_count(session_data, "jjajang")
+            sd = _get_wave_count(session_data, "djrg")
+            sn = _get_wave_count(session_data, "sdn")
             daily_ji_chang += sj
             daily_sesin += ss
             daily_jjajang += sjj
@@ -1522,22 +1524,22 @@ def _load_history_file(date: str) -> DailyHistoryResponse:
                 broadcast_title=session_data.get("broadcast_title", ""),
                 saved_at=session_data.get("saved_at", ""),
                 hot_moments=hot_moments,
-                total_ji_chang=sj,
-                total_sesin=ss,
-                total_jjajang=sjj,
-                total_djrg=sd,
-                total_sdn=sn
+                total_ji_chang_wave_count=sj,
+                total_sesin_wave_count=ss,
+                total_jjajang_wave_count=sjj,
+                total_djrg_wave_count=sd,
+                total_sdn_wave_count=sn,
             ))
         
         return DailyHistoryResponse(
             date=data.get("date", date),
             last_updated=data.get("last_updated"),
             sessions=sessions,
-            total_ji_chang=daily_ji_chang,
-            total_sesin=daily_sesin,
-            total_jjajang=daily_jjajang,
-            total_djrg=daily_djrg,
-            total_sdn=daily_sdn
+            total_ji_chang_wave_count=daily_ji_chang,
+            total_sesin_wave_count=daily_sesin,
+            total_jjajang_wave_count=daily_jjajang,
+            total_djrg_wave_count=daily_djrg,
+            total_sdn_wave_count=daily_sdn,
         )
     
     except (json.JSONDecodeError, IOError):
