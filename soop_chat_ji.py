@@ -51,7 +51,7 @@ class MemePattern:
 
 
 # 앱 설정 상수
-TARGET_BROADCASTER = BroadcasterConfig(id="tjrdbs999", name="지피티")
+TARGET_BROADCASTER = BroadcasterConfig(id="cnsgkcnehd74", name="조경훈")
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -520,22 +520,27 @@ class BroadcastStatusService:
             return None
     
     def _parse_broadcast_info(self, response: dict) -> Optional[BroadcastInfo]:
-        """API 응답에서 방송 정보를 추출합니다."""
+        """API 응답에서 방송 정보를 추출합니다. station API: station.broad_start → started_at."""
         broadcast_data = response.get("broad")
         if not broadcast_data:
             return None
-        
-        start_time = self._extract_broadcast_start_time(broadcast_data)
+        # station API: response["station"]["broad_start"] 값이 started_at에 들어가도록 우선 추출
+        station_data = response.get("station") or {}
+        start_time = self._extract_broadcast_start_time(station_data)
+        if start_time is None:
+            start_time = self._extract_broadcast_start_time(broadcast_data)
+        if start_time is None:
+            start_time = self._extract_broadcast_start_time(response)
         return BroadcastInfo(
             broadcast_no=broadcast_data["broad_no"],
             title=broadcast_data["broad_title"],
             start_time=start_time
         )
     
-    def _extract_broadcast_start_time(self, broadcast_data: dict) -> Optional[str]:
-        """방송 데이터에서 시작 시간 문자열을 추출합니다. 여러 API 필드명을 시도합니다."""
+    def _extract_broadcast_start_time(self, data: dict) -> Optional[str]:
+        """broad_start 등 시작 시간 필드를 추출합니다. station API는 broad_start 사용."""
         for key in ("broad_start", "broad_start_time", "start_time"):
-            value = broadcast_data.get(key)
+            value = data.get(key)
             if value is None:
                 continue
             if isinstance(value, (int, float)):
